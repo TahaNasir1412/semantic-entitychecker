@@ -487,7 +487,15 @@ Return your answer as a plain list, one entity per line, nothing else -- no numb
       const el = document.getElementById('entitiesInput');
       el.value = el.value.trim() + '\n' + suggested.join('\n');
       updateCounts();
-      out.innerHTML += `<p class="desc" style="margin-top:8px">Added to your entity list above -- click Check content again to include them.</p>`;
+      // Re-run the actual check immediately so the summary numbers below
+      // reflect the new list right away -- leaving them stale until a manual
+      // re-click was a real gap, not just a cosmetic one.
+      renderResults(parseEntities(el.value), document.getElementById('contentInput').value);
+      const note = document.createElement('p');
+      note.className = 'desc';
+      note.style.marginTop = '8px';
+      note.textContent = `Added ${suggested.length} entities and refreshed the results above -- scroll up to see the updated totals.`;
+      document.getElementById('results').prepend(note);
     });
   } catch (err) {
     out.innerHTML = `<p class="desc" style="color:var(--red)">Research failed (${err.code || err.message || 'error'}). Try again.</p>`;
@@ -537,7 +545,7 @@ ${redEntities.join(', ')}
 For EACH entity, decide:
 - "natural_fit": it can be added with a genuinely minimal edit -- extending an existing sentence with a short clause, or adding one short new sentence right next to something closely related -- without noticeably changing that sentence's structure or meaning.
 - "requires_adjustment": a natural, grammatically correct spot exists, but fitting the entity in means reworking the existing sentence somewhat more than a minimal insertion -- it must still read completely naturally when done, never forced or awkward.
-- "no_fit": no genuine natural spot exists anywhere in the content for this entity. Do not force one -- say so honestly.
+- "no_fit": no genuine natural spot exists anywhere in the content for this entity. Do not force one -- say so honestly, and make clear in your reason WHICH of these it is: (a) genuinely off-topic for what this content is actually about, given the niche/ICP you worked out, or (b) on-topic and plausibly relevant, but no specific sentence in THIS content currently gives it a natural opening.
 
 For "natural_fit" and "requires_adjustment" entities, quote the EXACT existing sentence you'd change, verbatim from the content above, and show your proposed revised version of that exact sentence with the entity included.
 
@@ -597,9 +605,20 @@ function renderAnalysisResults(analysis) {
       ${needsAdjustment.map((item, i) => entityRow(item, 'requires_adjustment', i)).join('')}
     </div>` : ''}
 
-    ${noFit.length ? `<div style="margin-top:16px">
-      <h4 style="font-size:13px;margin:0 0 8px"><span class="dot red" style="display:inline-block"></span> No natural fit found (${noFit.length}) -- not applied, shown for transparency</h4>
-      ${noFit.map(item => `<div style="font-size:12px;color:var(--ink-soft);padding:4px 0">${escapeHtml(item.entity)} -- ${escapeHtml(item.reason)}</div>`).join('')}
+    ${noFit.length ? `<div style="margin-top:16px" id="noFitSection">
+      <h4 style="font-size:13px;margin:0 0 8px"><span class="dot red" style="display:inline-block"></span> No natural fit found in the first pass (${noFit.length})</h4>
+      <p class="desc" style="margin:0 0 10px">The reason names whether this looks genuinely off-topic for this content, or just didn't have an obvious spot on the first pass -- either way, you can ask it to try again for any specific one below.</p>
+      ${noFit.map((item, i) => `
+        <div class="no-fit-row" data-idx="${i}" style="padding:10px 12px;border:1px solid var(--line);border-radius:7px;margin-bottom:8px;background:var(--bg)">
+          <div class="mono" style="font-size:12.5px;font-weight:600">${escapeHtml(item.entity)}</div>
+          <div style="font-size:12px;color:var(--ink-soft);margin:2px 0 8px">${escapeHtml(item.reason)}</div>
+          <div class="no-fit-actions" style="display:flex;gap:8px">
+            <button class="secondary" type="button" data-nofit-idx="${i}" data-mode="exact">Try to fit it in exactly</button>
+            <button class="secondary" type="button" data-nofit-idx="${i}" data-mode="partial">Try to fit it in partially</button>
+          </div>
+          <div class="no-fit-result" id="noFitResult${i}"></div>
+        </div>
+      `).join('')}
     </div>` : ''}
 
     ${(naturalFit.length + needsAdjustment.length) > 0 ? `
@@ -613,6 +632,8 @@ function renderAnalysisResults(analysis) {
     ` : ''}
   `;
 
+  window.CURRENT_ANALYSIS.retried = window.CURRENT_ANALYSIS.retried || [];
+
   document.getElementById('applySelectedBtn')?.addEventListener('click', applySelectedEntities);
   document.getElementById('selectAllBtn')?.addEventListener('click', () => {
     document.querySelectorAll('.entity-select').forEach(cb => cb.checked = true);
@@ -620,6 +641,75 @@ function renderAnalysisResults(analysis) {
   document.getElementById('selectNoneBtn')?.addEventListener('click', () => {
     document.querySelectorAll('.entity-select').forEach(cb => cb.checked = false);
   });
+  document.querySelectorAll('[data-nofit-idx]').forEach(btn => {
+    btn.addEventListener('click', () => retryEntityFit(parseInt(btn.dataset.nofitIdx, 10), btn.dataset.mode));
+  });
+}
+
+async function retryEntityFit(idx, mode) {
+  const { content } = window.CURRENT_CHECK;
+  const item = window.CURRENT_ANALYSIS.no_fit[idx];
+  const resultEl = document.getElementById('noFitResult' + idx);
+  const rowEl = document.querySelector(`.no-fit-row[data-idx="${idx}"]`);
+  rowEl.querySelectorAll('button').forEach(b => b.disabled = true);
+  resultEl.innerHTML = `<div class="loading" style="margin-top:8px"><div class="spinner"></div>Looking for a spot for this specific entity...</div>`;
+
+  const sample = await getSample();
+  const modeInstruction = mode === 'exact'
+    ? 'Find a spot for it with a MINIMAL insertion -- extending an existing sentence with a short clause, or adding one short new sentence next to something closely related -- without noticeably changing that sentence\'s structure.'
+    : 'You have more room to work with here than a minimal insertion -- find a spot for it even if it means reworking an existing sentence somewhat more than usual, as long as the result reads completely naturally and stays grammatically correct.';
+
+  const prompt = `An earlier pass concluded this specific entity had no natural fit in the content below, for this reason: "${item.reason}"
+
+You are being asked to look again, specifically for this one entity, with a different constraint: ${modeInstruction}
+
+CONTENT:
+${content}
+
+ENTITY TO PLACE: "${item.entity}"
+
+If you can genuinely find a natural spot under this constraint, quote the EXACT existing sentence you'd change, verbatim from the content, and your proposed revised version.
+If you genuinely still cannot find any honest way to include it -- because it's truly unrelated to this content's topic, not just because it's hard -- say so plainly instead of forcing something awkward.
+
+Return ONLY valid JSON:
+{"found": true or false, "heading": "exact heading this falls under, or null", "before": "exact existing sentence, or null if found is false", "after": "proposed revised sentence, or null if found is false", "reason_if_not_found": "one short line, or null if found is true"}`;
+
+  try {
+    const result = await sample.json(prompt, { modelTier: "default", maxTokens: 1024 });
+    if (result.found) {
+      const retriedIdx = window.CURRENT_ANALYSIS.retried.length;
+      window.CURRENT_ANALYSIS.retried.push({ entity: item.entity, heading: result.heading, before: result.before, after: result.after, type: mode === 'exact' ? 'exact' : 'adjusted' });
+      resultEl.innerHTML = `
+        <label style="display:block;margin-top:8px;cursor:pointer">
+          <div style="display:flex;gap:10px;align-items:flex-start">
+            <input type="checkbox" class="entity-select" data-group="retried" data-idx="${retriedIdx}" checked style="margin-top:3px">
+            <div style="flex:1">
+              ${result.heading ? `<div style="font-size:11px;color:var(--ink-soft);margin-bottom:4px">under: ${escapeHtml(result.heading)}</div>` : ''}
+              <div style="font-size:12px;color:var(--ink-soft)"><s>${escapeHtml(result.before)}</s></div>
+              <div style="font-size:12px;margin-top:2px">${escapeHtml(result.after)}</div>
+            </div>
+          </div>
+        </label>`;
+      // A previously-inapplicable entity now has a real proposal -- make sure
+      // the Apply button and its controls exist even if this was the only one.
+      if (!document.getElementById('applySelectedBtn')) {
+        document.getElementById('noFitSection').insertAdjacentHTML('afterend', `
+          <div style="margin-top:18px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+            <button id="applySelectedBtn">Apply selected entities</button>
+            <span class="msg" id="applyMsg"></span>
+          </div>
+          <div id="applyResult"></div>
+        `);
+        document.getElementById('applySelectedBtn').addEventListener('click', applySelectedEntities);
+      }
+    } else {
+      resultEl.innerHTML = `<div style="font-size:12px;color:var(--ink-soft);margin-top:6px">Still no genuine fit${result.reason_if_not_found ? ': ' + escapeHtml(result.reason_if_not_found) : '.'}</div>`;
+    }
+  } catch (err) {
+    resultEl.innerHTML = `<div style="font-size:12px;color:var(--red);margin-top:6px">Something went wrong (${err.code || err.message || 'error'}). Try again.</div>`;
+  } finally {
+    rowEl.querySelectorAll('button').forEach(b => b.disabled = false);
+  }
 }
 
 async function applySelectedEntities() {
@@ -630,7 +720,10 @@ async function applySelectedEntities() {
     const group = cb.dataset.group;
     const idx = parseInt(cb.dataset.idx, 10);
     const item = analysis[group][idx];
-    selected.push({ ...item, type: group === 'natural_fit' ? 'exact' : 'adjusted' });
+    // Retried entities already carry their own type (set when the retry
+    // succeeded); the original two groups derive it from which group they're in.
+    const type = item.type || (group === 'natural_fit' ? 'exact' : 'adjusted');
+    selected.push({ ...item, type });
   });
 
   const btn = document.getElementById('applySelectedBtn');
