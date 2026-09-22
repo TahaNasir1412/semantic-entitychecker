@@ -156,6 +156,7 @@
     font-size: 11.5px; color: var(--amber); background: var(--amber-bg);
     padding: 6px 10px; border-radius: 5px; margin-top: 10px; display: inline-block;
   }
+  @media (max-width: 860px) { .before-after-grid { grid-template-columns: 1fr !important; } }
 </style>
 </head>
 <body>
@@ -417,11 +418,11 @@ function renderResults(entities, content) {
     </div>
 
     <div class="action-panel" id="rewritePanel" style="display:${redCount > 0 ? 'block' : 'none'}">
-      <h3>Naturally work in the ${redCount} missing entit${redCount === 1 ? 'y' : 'ies'}</h3>
-      <p class="desc">Takes your existing content and inserts only the red (unused) entities into sentences where they genuinely fit -- doesn't restructure, rewrite, or change your existing wording otherwise. Re-checks the result automatically so you can confirm every gap actually closed.</p>
-      <button id="rewriteBtn">Generate revised content</button>
-      <span class="msg" id="rewriteMsg"></span>
-      <div id="rewriteResult"></div>
+      <h3>Work in missing entities -- your choice, per entity</h3>
+      <p class="desc">First analyzes where each of the ${redCount} missing entities could actually fit -- without changing anything yet. You pick which ones to apply, then it makes only those specific changes and shows you exactly what changed, before vs. after.</p>
+      <button id="analyzeBtn">Analyze missing entities</button>
+      <span class="msg" id="analyzeMsg"></span>
+      <div id="analyzeResult"></div>
     </div>
   `;
 
@@ -432,8 +433,8 @@ function renderResults(entities, content) {
 function wireActionPanels() {
   const researchBtn = document.getElementById('researchBtn');
   if (researchBtn) researchBtn.addEventListener('click', runEntityResearch);
-  const rewriteBtn = document.getElementById('rewriteBtn');
-  if (rewriteBtn) rewriteBtn.addEventListener('click', runContentRewrite);
+  const analyzeBtn = document.getElementById('analyzeBtn');
+  if (analyzeBtn) analyzeBtn.addEventListener('click', runEntityAnalysis);
 }
 
 async function runEntityResearch() {
@@ -495,68 +496,248 @@ Return your answer as a plain list, one entity per line, nothing else -- no numb
   }
 }
 
-async function runContentRewrite() {
-  const { entities, content, results } = window.CURRENT_CHECK;
+// Lightweight heading detector -- same two formats the rest of this project's
+// tools already support (markdown # ## ### and label-style H1:/H2:/H3:). Used
+// only to verify structural preservation after a rewrite -- never to force a
+// format on content that has none.
+function detectHeadings(text) {
+  return text.split('\n').map(l => l.trim()).filter(Boolean)
+    .map(line => {
+      let m = line.match(/^(#{1,3})\s+(.*)$/);
+      if (m) return m[2].trim();
+      m = line.match(/^H([123])\s*:\s*(.*)$/i);
+      if (m) return m[2].trim();
+      return null;
+    }).filter(Boolean);
+}
+
+async function runEntityAnalysis() {
+  const { content } = window.CURRENT_CHECK;
+  const results = window.CURRENT_CHECK.results;
   const redEntities = results.filter(r => r.status === 'red').map(r => r.entity);
-  const btn = document.getElementById('rewriteBtn');
-  const msg = document.getElementById('rewriteMsg');
-  const out = document.getElementById('rewriteResult');
+  const btn = document.getElementById('analyzeBtn');
+  const msg = document.getElementById('analyzeMsg');
+  const out = document.getElementById('analyzeResult');
   btn.disabled = true;
   const wordCount = countWords(content);
-  msg.textContent = wordCount > 2000 ? 'This may take a minute for longer content...' : 'Working...';
+  msg.textContent = wordCount > 2000 ? 'This may take a minute for longer content...' : 'Analyzing...';
   out.innerHTML = '';
 
   const sample = await getSample();
-  const prompt = `You are editing existing content to naturally include specific missing terms -- you are NOT rewriting it.
+  const prompt = `You are analyzing existing content to find natural opportunities to include specific missing terms -- you are NOT making any changes yet, only proposing them.
 
-EXISTING CONTENT (reproduce this almost entirely unchanged):
+First, understand this content yourself: what it's actually about, the realistic searcher's intent and pain points around it, the way a specialist in this niche would understand it. Use that understanding to judge what actually counts as a natural fit versus a forced one.
+
+EXISTING CONTENT:
 ${content}
 
-MISSING ENTITIES TO WORK IN NATURALLY:
+MISSING ENTITIES TO EVALUATE:
 ${redEntities.join(', ')}
 
-RULES -- these are strict:
-1. Do NOT restructure the content, remove sentences, change the tone, or rewrite passages that don't need it.
-2. For each missing entity, find an EXISTING sentence or paragraph where it genuinely fits contextually, and insert it there with the smallest possible edit -- extend a sentence, add a clause, or add one short sentence next to a closely related existing one. Never force an entity in where it doesn't make sense.
-3. If a genuinely natural spot doesn't exist for a given entity, it is fine to leave it out rather than force it in awkwardly -- do not sacrifice readability to hit every single one.
-4. Keep every existing sentence that doesn't need a change exactly as it was, word for word.
-5. Return the FULL revised content, start to finish -- not a diff, not just the changed parts.
+For EACH entity, decide:
+- "natural_fit": it can be added with a genuinely minimal edit -- extending an existing sentence with a short clause, or adding one short new sentence right next to something closely related -- without noticeably changing that sentence's structure or meaning.
+- "requires_adjustment": a natural, grammatically correct spot exists, but fitting the entity in means reworking the existing sentence somewhat more than a minimal insertion -- it must still read completely naturally when done, never forced or awkward.
+- "no_fit": no genuine natural spot exists anywhere in the content for this entity. Do not force one -- say so honestly.
 
-Return ONLY the revised content itself, nothing else -- no preamble, no explanation, no notes about what you changed.`;
+For "natural_fit" and "requires_adjustment" entities, quote the EXACT existing sentence you'd change, verbatim from the content above, and show your proposed revised version of that exact sentence with the entity included.
 
-  // Output needs to cover the full content length plus the inserted material --
-  // sized generously so a long page doesn't get cut off mid-rewrite.
-  const estimatedTokens = Math.min(32768, Math.max(4096, Math.ceil(wordCount * 1.6) + 1000));
+Do not propose changes for entities you'd classify as "no_fit."
+
+Return ONLY valid JSON:
+{
+  "natural_fit": [{"entity": "...", "heading": "the exact heading this sentence falls under, or null if the content has no headings", "before": "exact existing sentence", "after": "proposed revised sentence"}],
+  "requires_adjustment": [{"entity": "...", "heading": "...", "before": "exact existing sentence", "after": "proposed revised sentence"}],
+  "no_fit": [{"entity": "...", "reason": "one short line"}]
+}`;
+
+  const estimatedTokens = Math.min(32768, Math.max(4096, Math.ceil(redEntities.length * 120) + 1000));
 
   try {
-    const result = await sample(prompt, { modelTier: "default", maxTokens: estimatedTokens });
-    const revised = result.text.trim();
+    const result = await sample.json(prompt, { modelTier: "default", maxTokens: estimatedTokens });
+    msg.textContent = '';
+    window.CURRENT_ANALYSIS = result;
+    renderAnalysisResults(result);
+  } catch (err) {
+    out.innerHTML = `<p class="desc" style="color:var(--red)">Something went wrong (${err.code || err.message || 'error'}). Try again.</p>`;
+    msg.textContent = '';
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function renderAnalysisResults(analysis) {
+  const out = document.getElementById('analyzeResult');
+  const naturalFit = analysis.natural_fit || [];
+  const needsAdjustment = analysis.requires_adjustment || [];
+  const noFit = analysis.no_fit || [];
+
+  function entityRow(item, group, idx) {
+    return `
+      <label style="display:block;padding:10px 12px;border:1px solid var(--line);border-radius:7px;margin-bottom:8px;cursor:pointer;background:var(--bg)">
+        <div style="display:flex;gap:10px;align-items:flex-start">
+          <input type="checkbox" class="entity-select" data-group="${group}" data-idx="${idx}" checked style="margin-top:3px">
+          <div style="flex:1">
+            <div class="mono" style="font-size:12.5px;font-weight:600">${escapeHtml(item.entity)}</div>
+            ${item.heading ? `<div style="font-size:11px;color:var(--ink-soft);margin:2px 0 6px">under: ${escapeHtml(item.heading)}</div>` : ''}
+            <div style="font-size:12px;color:var(--ink-soft)"><s>${escapeHtml(item.before)}</s></div>
+            <div style="font-size:12px;margin-top:2px">${escapeHtml(item.after)}</div>
+          </div>
+        </div>
+      </label>`;
+  }
+
+  out.innerHTML = `
+    ${naturalFit.length ? `<div style="margin-top:16px">
+      <h4 style="font-size:13px;margin:0 0 8px"><span class="dot green" style="display:inline-block"></span> Natural fit -- minimal edit (${naturalFit.length})</h4>
+      ${naturalFit.map((item, i) => entityRow(item, 'natural_fit', i)).join('')}
+    </div>` : ''}
+
+    ${needsAdjustment.length ? `<div style="margin-top:16px">
+      <h4 style="font-size:13px;margin:0 0 8px"><span class="dot amber" style="display:inline-block"></span> Needs a small sentence adjustment (${needsAdjustment.length})</h4>
+      ${needsAdjustment.map((item, i) => entityRow(item, 'requires_adjustment', i)).join('')}
+    </div>` : ''}
+
+    ${noFit.length ? `<div style="margin-top:16px">
+      <h4 style="font-size:13px;margin:0 0 8px"><span class="dot red" style="display:inline-block"></span> No natural fit found (${noFit.length}) -- not applied, shown for transparency</h4>
+      ${noFit.map(item => `<div style="font-size:12px;color:var(--ink-soft);padding:4px 0">${escapeHtml(item.entity)} -- ${escapeHtml(item.reason)}</div>`).join('')}
+    </div>` : ''}
+
+    ${(naturalFit.length + needsAdjustment.length) > 0 ? `
+      <div style="margin-top:18px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        <button id="applySelectedBtn">Apply selected entities</button>
+        <button class="secondary" type="button" id="selectAllBtn">Select all</button>
+        <button class="secondary" type="button" id="selectNoneBtn">Select none</button>
+        <span class="msg" id="applyMsg"></span>
+      </div>
+      <div id="applyResult"></div>
+    ` : ''}
+  `;
+
+  document.getElementById('applySelectedBtn')?.addEventListener('click', applySelectedEntities);
+  document.getElementById('selectAllBtn')?.addEventListener('click', () => {
+    document.querySelectorAll('.entity-select').forEach(cb => cb.checked = true);
+  });
+  document.getElementById('selectNoneBtn')?.addEventListener('click', () => {
+    document.querySelectorAll('.entity-select').forEach(cb => cb.checked = false);
+  });
+}
+
+async function applySelectedEntities() {
+  const { content, entities } = window.CURRENT_CHECK;
+  const analysis = window.CURRENT_ANALYSIS;
+  const selected = [];
+  document.querySelectorAll('.entity-select:checked').forEach(cb => {
+    const group = cb.dataset.group;
+    const idx = parseInt(cb.dataset.idx, 10);
+    const item = analysis[group][idx];
+    selected.push({ ...item, type: group === 'natural_fit' ? 'exact' : 'adjusted' });
+  });
+
+  const btn = document.getElementById('applySelectedBtn');
+  const msg = document.getElementById('applyMsg');
+  const out = document.getElementById('applyResult');
+  if (!selected.length) {
+    msg.textContent = 'Select at least one entity first.';
+    return;
+  }
+  btn.disabled = true;
+  const wordCount = countWords(content);
+  msg.textContent = wordCount > 2000 ? 'Applying changes -- this may take a minute for longer content...' : 'Applying changes...';
+  out.innerHTML = '';
+
+  const sample = await getSample();
+  const prompt = `You are editing existing content to apply ONLY the specific approved changes listed below -- nothing else.
+
+EXISTING CONTENT (this is the full, complete content -- your output must preserve all of it):
+${content}
+
+APPROVED CHANGES TO APPLY (apply every one of these; the proposed wording is a strong guide, adjust only as needed for it to read perfectly naturally in the final context):
+${selected.map((s, i) => `${i+1}. Entity: "${s.entity}"${s.heading ? ' (under: ' + s.heading + ')' : ''}\n   Change this exact sentence: "${s.before}"\n   Into: "${s.after}"`).join('\n')}
+
+RULES -- strict:
+1. Apply every approved change above, and nothing beyond them -- do not add, remove, or edit anything else.
+2. Preserve the ENTIRE original content: every heading, every section, even ones with no changes, must appear in your output, unchanged, in the same order, with nothing trimmed or removed.
+3. Return the full content, start to finish, in the same format it was given to you.
+
+Return ONLY valid JSON:
+{
+  "revised_content": "the full content, unchanged except for the approved insertions listed above",
+  "changes_applied": [{"entity": "...", "heading": "... or null", "before": "...", "after": "...", "type": "exact or adjusted"}]
+}`;
+
+  const estimatedTokens = Math.min(32768, Math.max(4096, Math.ceil(wordCount * 1.6) + selected.length * 100 + 1000));
+
+  try {
+    const result = await sample.json(prompt, { modelTier: "default", maxTokens: estimatedTokens });
     msg.textContent = '';
 
-    // Re-check the revised content locally (no AI needed) so the user can
-    // confirm every previously-red entity actually got resolved.
-    const { results: newResults } = checkEntities(entities, revised);
-    const stillRed = newResults.filter(r => r.status === 'red');
+    const revised = result.revised_content || '';
+    const changesApplied = result.changes_applied || selected.map(s => ({ entity: s.entity, heading: s.heading, before: s.before, after: s.after, type: s.type }));
+
+    // Structural preservation check: every heading present before must still
+    // be present after, same count -- a rewrite that silently drops a whole
+    // section is a real failure mode, not a nitpick, so this is checked
+    // directly rather than trusted.
+    const headingsBefore = detectHeadings(content);
+    const headingsAfter = detectHeadings(revised);
+    const structureOk = headingsBefore.length === headingsAfter.length &&
+      headingsBefore.every((h, i) => h === headingsAfter[i]);
+
+    // Highlight applied entities directly in the revised content -- exact-type
+    // green, adjusted-type amber -- using the same literal phrase-match
+    // highlighter already used and tested elsewhere in this tool.
+    const exactPhrases = changesApplied.filter(c => c.type === 'exact').map(c => c.entity);
+    const adjustedPhrases = changesApplied.filter(c => c.type !== 'exact').map(c => c.entity);
+    const { highlightSpans: afterSpans } = checkEntities([...exactPhrases, ...adjustedPhrases], revised);
+    // checkEntities marks everything found as green by default; re-tag adjusted-type spans amber
+    const adjustedSet = new Set(adjustedPhrases.map(e => e.toLowerCase()));
+    afterSpans.forEach(span => {
+      const spanText = revised.slice(span.start, span.end).toLowerCase();
+      if ([...adjustedSet].some(a => spanText.includes(a) || a.includes(spanText))) span.cls = 'hl-amber';
+    });
 
     out.innerHTML = `
-      <textarea class="rewrite-output" readonly>${escapeHtml(revised)}</textarea>
-      <div style="margin-top:10px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
-        <button class="secondary" id="copyRewriteBtn" type="button">Copy to clipboard</button>
-        <span class="msg">${stillRed.length === 0
-          ? 'All previously-missing entities are now used.'
-          : stillRed.length + ' still not naturally fitting: ' + stillRed.map(r => r.entity).join(', ')}</span>
+      ${!structureOk ? `<div class="grounding-note" style="background:var(--red-bg);color:var(--red)">Heading structure doesn't match before vs. after (${headingsBefore.length} headings before, ${headingsAfter.length} after) -- do not use this version. Try again, or apply fewer entities at once.</div>` : ''}
+
+      <h4 style="font-size:13px;margin:16px 0 8px">What changed, by heading</h4>
+      ${changesApplied.map(c => `
+        <div style="padding:10px 0;border-bottom:1px solid var(--line)">
+          <div style="font-size:11.5px;color:var(--ink-soft)">${c.heading ? 'Under: ' + escapeHtml(c.heading) + ' — ' : ''}added <span class="mono">"${escapeHtml(c.entity)}"</span> (${c.type === 'exact' ? 'used as-is' : 'sentence adjusted'})</div>
+          <div style="font-size:12px;margin-top:4px"><s style="color:var(--ink-soft)">${escapeHtml(c.before)}</s></div>
+          <div style="font-size:12px;margin-top:2px">${escapeHtml(c.after)}</div>
+        </div>
+      `).join('')}
+
+      <h4 style="font-size:13px;margin:20px 0 8px">Before vs. after -- full content, side by side</h4>
+      <div class="legend">
+        <span><mark class="hl-green" style="padding:2px 6px">used exactly</mark></span>
+        <span><mark class="hl-amber" style="padding:2px 6px">sentence adjusted</mark></span>
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px" class="before-after-grid">
+        <div>
+          <div style="font-size:11.5px;color:var(--ink-soft);margin-bottom:6px">BEFORE</div>
+          <div class="content-view" style="max-height:600px">${escapeHtml(content)}</div>
+        </div>
+        <div>
+          <div style="font-size:11.5px;color:var(--ink-soft);margin-bottom:6px">AFTER</div>
+          <div class="content-view" style="max-height:600px">${renderHighlightedContent(revised, afterSpans)}</div>
+        </div>
+      </div>
+
+      <div style="margin-top:14px;display:flex;gap:8px">
+        <button class="secondary" id="copyRevisedBtn" type="button">Copy full revised content</button>
       </div>
     `;
-    document.getElementById('copyRewriteBtn').addEventListener('click', () => {
+    document.getElementById('copyRevisedBtn').addEventListener('click', () => {
       navigator.clipboard.writeText(revised).then(() => {
-        const b = document.getElementById('copyRewriteBtn');
+        const b = document.getElementById('copyRevisedBtn');
         const orig = b.textContent;
         b.textContent = 'Copied ✓';
         setTimeout(() => { b.textContent = orig; }, 1500);
       });
     });
   } catch (err) {
-    out.innerHTML = `<p class="desc" style="color:var(--red)">Something went wrong (${err.code || err.message || 'error'}). Try again -- very long content may need a retry.</p>`;
+    out.innerHTML = `<p class="desc" style="color:var(--red)">Something went wrong (${err.code || err.message || 'error'}). Try again -- very long content or many selected entities at once may need a retry with fewer selected.</p>`;
     msg.textContent = '';
   } finally {
     btn.disabled = false;
