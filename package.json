@@ -2,6 +2,7 @@
   "name": "semantic-entity-checker",
   "version": "1.0.0",
   "private": true,
+  "type": "module",
   "description": "Semantic entity coverage checker for SEO content -- exact/partial/missing matching, AI-powered research for additional entities used by similar top-ranking content, and natural insertion of missing entities into existing content up to ~10,000 words. Gemini-powered backend on Vercel, Groq fallback.",
   "scripts": {
     "dev": "vercel dev"
